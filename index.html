@@ -1235,12 +1235,24 @@ const MAX_VOICE_SECONDS = 300;
 const ALLOWED_IMAGE_TYPES = ["image/png","image/jpeg","image/jpg","image/gif","image/webp"];
 const ALLOWED_FILE_EXT = ["pdf","doc","docx","xls","xlsx","ppt","pptx","txt","zip","rar","csv"];
 
+// STUN alone can only establish a direct peer-to-peer path, which fails
+// whenever either side is behind a hard NAT (very common on mobile data /
+// carrier networks). A TURN server relays the media instead, so calls still
+// work across two completely different networks. The openrelay.metered.ca
+// credentials below are a public/free TURN service meant for exactly this
+// kind of small personal project — for a more reliable long-term setup,
+// create a free TURN account (e.g. at metered.ca) and swap in your own
+// urls/username/credential here.
 const STUN_SERVERS = {
   iceServers: [
     { urls: "stun:stun.l.google.com:19302" },
     { urls: "stun:stun1.l.google.com:19302" },
     { urls: "stun:stun2.l.google.com:19302" },
-  ]
+    { urls: "turn:openrelay.metered.ca:80", username: "openrelayproject", credential: "openrelayproject" },
+    { urls: "turn:openrelay.metered.ca:443", username: "openrelayproject", credential: "openrelayproject" },
+    { urls: "turn:openrelay.metered.ca:443?transport=tcp", username: "openrelayproject", credential: "openrelayproject" },
+  ],
+  iceCandidatePoolSize: 4
 };
 
 // The day it all began — used for the "together since" counter.

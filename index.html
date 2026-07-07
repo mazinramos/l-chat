@@ -1789,8 +1789,12 @@ document.addEventListener("visibilitychange", ()=>{
 });
 window.addEventListener("beforeunload", ()=>{
   if (state.currentEmail) navigator.sendBeacon && setPresence(false);
+  if (state.pc) updateDoc(callDocRef(), { status:"ended" }).catch(()=>{});
 });
-window.addEventListener("pagehide", ()=>{ if (state.currentEmail) setPresence(false); });
+window.addEventListener("pagehide", ()=>{
+  if (state.currentEmail) setPresence(false);
+  if (state.pc) updateDoc(callDocRef(), { status:"ended" }).catch(()=>{});
+});
 
 function listenToPresence(){
   const unsub = onSnapshot(doc(db,"users",state.otherEmail), (snap)=>{
@@ -2780,8 +2784,15 @@ async function initiateCall(type){
   if (!navigator.onLine) return showErrorDialog("No internet connection", "Connect to the internet to start a call.");
   try{
     const existing = await getDoc(callDocRef());
-    if (existing.exists() && existing.data().status === "ringing" || (existing.exists() && existing.data().status === "connected")){
-      return showToast("A call is already in progress", "warning");
+    if (existing.exists() && ["ringing","connected"].includes(existing.data().status)){
+      // A leftover call doc from a crashed tab/browser close can otherwise
+      // block calling forever — treat anything older than 2 minutes as stale
+      // and let a fresh call overwrite it instead of hard-blocking.
+      const createdAt = existing.data().createdAt;
+      const ageMs = createdAt && createdAt.toDate ? Date.now() - createdAt.toDate().getTime() : Infinity;
+      if (ageMs < 120000){
+        return showToast("A call is already in progress", "warning");
+      }
     }
   } catch(e){}
 
@@ -2816,8 +2827,8 @@ async function initiateCall(type){
     state._ringTimeout = setTimeout(async ()=>{
       const snap = await getDoc(callDocRef());
       if (snap.exists() && snap.data().status === "ringing"){
-        await endCall(false);
         handleError("call-timeout", {});
+        await endCall(true); // notify + clean up Firestore so the callee's banner clears too
       }
     }, 45000);
   } catch(err){
@@ -2907,9 +2918,21 @@ function setupCallUI(mode, type){
 function listenForAnswer(){
   state.callDocUnsub = onSnapshot(callDocRef(), async (snap)=>{
     const data = snap.data();
-    if (!data) return;
+    // A missing document means the other side already ended and cleaned up
+    // the call — this can race ahead of a "status: ended" update reaching us,
+    // so treat "gone" exactly like "ended" instead of silently doing nothing.
+    if (!data){
+      if (state.pc) await endCall(false);
+      return;
+    }
     if (data.answer && state.pc && !state.pc.currentRemoteDescription){
       await state.pc.setRemoteDescription(new RTCSessionDescription(data.answer));
+      // Candidates that arrived while we were still ringing were queued
+      // because there was no remote description to attach them to yet.
+      // Flush them now — waiting until "connected" is too late, since the
+      // connection often can't reach "connected" without these candidates.
+      state.candidateQueue.forEach(c=> state.pc.addIceCandidate(c).catch(()=>{}));
+      state.candidateQueue = [];
     }
     if (data.status === "declined"){
       showToast("Call declined", "info");
@@ -2954,9 +2977,12 @@ function onCallConnected(){
       $("callTimer").textContent = formatDuration(state.callSeconds);
     }, 1000);
   }
-  // flush queued candidates
-  state.candidateQueue.forEach(c=> state.pc.addIceCandidate(c).catch(()=>{}));
-  state.candidateQueue = [];
+  // Safety net: flush any candidates that somehow weren't flushed already
+  // (normal flow now flushes right after the remote description is set).
+  if (state.candidateQueue.length){
+    state.candidateQueue.forEach(c=> state.pc.addIceCandidate(c).catch(()=>{}));
+    state.candidateQueue = [];
+  }
 }
 
 // ---- Incoming call handling ----

@@ -329,6 +329,8 @@ a{color:inherit;}
 
 /* Messages list */
 .messages-wrap{flex:1; position:relative; overflow:hidden; background-size:cover; background-position:center; transition:background .4s ease;}
+.messages-wrap.drag-over{outline:3px dashed var(--accent-a); outline-offset:-6px;}
+.messages-wrap.drag-over::before{content:'Drop to send'; position:absolute; inset:0; z-index:8; display:flex; align-items:center; justify-content:center; font-size:16px; font-weight:700; color:#fff; background:rgba(10,132,255,.25); backdrop-filter:blur(4px); pointer-events:none;}
 .messages-wrap::after{content:'';position:absolute;inset:0;background:linear-gradient(180deg, rgba(5,7,13,.30), rgba(5,7,13,.52)); pointer-events:none; z-index:0;}
 #messagesList{position:relative; z-index:1;}
 #messagesList{
@@ -441,6 +443,7 @@ a{color:inherit;}
 }
 .recording-bar.active{display:flex;}
 .rec-dot{width:9px;height:9px;border-radius:50%; background:var(--danger); animation:micPulse 1s infinite;}
+.recording-bar.paused .rec-dot{animation:none; opacity:.4;}
 .rec-timer{font-variant-numeric:tabular-nums; font-weight:600; font-size:13.5px; color:#ff8079;}
 .rec-wave{flex:1; display:flex; align-items:center; gap:2px; height:20px; overflow:hidden;}
 .rec-wave span{width:3px; background:#ff8079; border-radius:2px; flex-shrink:0; opacity:.7;}
@@ -901,6 +904,9 @@ a{color:inherit;}
       <button class="call-btn" id="toggleCamBtn" aria-label="Toggle camera">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M23 7l-7 5 7 5V7z"/><rect x="1" y="5" width="15" height="14" rx="2"/></svg>
       </button>
+      <button class="call-btn" id="switchCamBtn" aria-label="Switch camera" style="display:none;">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M23 4v6h-6M1 20v-6h6"/><path d="M3.51 9a9 9 0 0114.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0020.49 15"/></svg>
+      </button>
       <button class="call-btn hangup" id="hangupBtn" aria-label="End call">
         <svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 16.92v3a2 2 0 01-2.18 2 19.79 19.79 0 01-8.63-3.07 19.5 19.5 0 01-6-6 19.79 19.79 0 01-3.07-8.67A2 2 0 014.11 2h3a2 2 0 012 1.72c.127.96.362 1.903.7 2.81a2 2 0 01-.45 2.11L8.09 9.91a16 16 0 006 6l1.27-1.27a2 2 0 012.11-.45c.907.338 1.85.573 2.81.7A2 2 0 0122 16.92z" transform="rotate(135 12 12)"/></svg>
       </button>
@@ -1231,6 +1237,7 @@ const DISPLAY_NAMES = { "mazin@gmail.com": "Mazin", "hebo@gmail.com": "Hebo" };
 
 const MAX_IMAGE_MB = 10;
 const MAX_FILE_MB = 25;
+const MAX_VIDEO_MB = 50;
 const MAX_VOICE_SECONDS = 300;
 const ALLOWED_IMAGE_TYPES = ["image/png","image/jpeg","image/jpg","image/gif","image/webp"];
 const ALLOWED_FILE_EXT = ["pdf","doc","docx","xls","xlsx","ppt","pptx","txt","zip","rar","csv"];
@@ -1294,10 +1301,19 @@ const state = {
   recordedBlob: null,
   recordedDuration: 0,
   pendingVoiceURL: null,
+  pausedElapsedMs: 0,
+  pauseStartedAt: null,
+  audioCtx: null,
+  analyser: null,
+  waveformDataArray: null,
+  recordedWaveform: [],
 
   // pending uploads
   pendingImageFile: null,
   pendingDocFile: null,
+  pendingVideoFile: null,
+  pendingVideoURL: null,
+  pendingAudioFile: null,
 
   // WebRTC
   pc: null,
@@ -2132,7 +2148,14 @@ function listenToSharedBackground(){
     state.currentBackground = data || null;
     applyBackground(data);
     renderBgPresetGrid();
-  }, (err)=> console.warn("Background listener failed:", err));
+    // Same shared doc also carries the pinned-message reference — handled
+    // here too so we don't open a second listener on the same document.
+    const newPinnedId = (data && data.pinnedMessageId) || null;
+    if (newPinnedId !== state.pinnedMessageId){
+      state.pinnedMessageId = newPinnedId;
+      renderPinBanner();
+    }
+  }, (err)=> console.warn("Shared settings listener failed:", err));
   state.unsubscribers.push(unsub);
 }
 
@@ -2214,7 +2237,8 @@ $("bgFileInput").addEventListener("change", async (e)=>{
 });
 
 /* =====================================================================
-   SECTION 11 — MESSAGING (send / receive / render)
+   SECTION 11 — MESSAGING (send / receive / render / reply / edit / delete /
+   forward / pin / favorite / search / infinite history)
    ===================================================================== */
 function autoResizeInput(){
   const el = $("messageInput");
@@ -2229,29 +2253,62 @@ function toggleSendButton(){
 
 function messagesCol(){ return collection(db,"messages"); }
 
+/* ---- Reply / edit composer context ---- */
+function showComposerContext(mode, label, snippet){
+  $("ccbLabel").textContent = label;
+  $("ccbSnippet").textContent = snippet || "";
+  $("composerContextBar").style.display = "flex";
+  $("composerContextBar").dataset.mode = mode;
+}
+function hideComposerContext(){
+  $("composerContextBar").style.display = "none";
+  state.replyingTo = null;
+  state.editingMessageId = null;
+}
+$("ccbCancelBtn").addEventListener("click", ()=>{
+  hideComposerContext();
+  $("messageInput").value = "";
+  autoResizeInput();
+  toggleSendButton();
+});
+
 async function sendTextMessage(){
   const raw = $("messageInput").value;
   const text = sanitizeText(raw);
   if (!text) return;
   if (!requireAuth()) return;
+  if (state.isSending) return; // prevent duplicate sends (e.g. double Enter/click)
+  state.isSending = true;
+
+  const editingId = state.editingMessageId;
+  const replyContext = state.replyingTo;
 
   $("messageInput").value = "";
   autoResizeInput();
   toggleSendButton();
+  hideComposerContext();
   setTypingState(false);
 
   try{
-    await addDoc(messagesCol(), {
-      type: "text",
-      text,
-      senderEmail: state.currentEmail,
-      recipientEmail: state.otherEmail,
-      status: "sent",
-      timestamp: serverTimestamp()
-    });
+    if (editingId){
+      await updateDoc(doc(db,"messages",editingId), { text, edited:true, editedAt: serverTimestamp() });
+    } else {
+      const payload = {
+        type: "text",
+        text,
+        senderEmail: state.currentEmail,
+        recipientEmail: state.otherEmail,
+        status: "sent",
+        timestamp: serverTimestamp()
+      };
+      if (replyContext) payload.replyTo = replyContext;
+      await addDoc(messagesCol(), payload);
+    }
   } catch(err){
     handleError("send-message", err);
-    showToast("Message failed to send", "error");
+    showToast(editingId ? "Failed to save edit" : "Message failed to send", "error");
+  } finally{
+    state.isSending = false;
   }
 }
 $("sendBtn").addEventListener("click", sendTextMessage);
@@ -2259,6 +2316,12 @@ $("messageInput").addEventListener("keydown", (e)=>{
   if (e.key === "Enter" && !e.shiftKey){
     e.preventDefault();
     sendTextMessage();
+  }
+  if (e.key === "Escape" && (state.replyingTo || state.editingMessageId)){
+    hideComposerContext();
+    $("messageInput").value = "";
+    autoResizeInput();
+    toggleSendButton();
   }
 });
 
@@ -2270,47 +2333,115 @@ function requireAuth(){
   return true;
 }
 
+/* ---- Real-time listener: most recent window of messages ---- */
+const LIVE_WINDOW_SIZE = 200;
+
 function listenToMessages(){
-  const q = query(messagesCol(), orderBy("timestamp","asc"), limit(500));
+  const q = query(messagesCol(), orderBy("timestamp","desc"), limit(LIVE_WINDOW_SIZE));
   let firstLoad = true;
   const unsub = onSnapshot(q, (snap)=>{
-    snap.docChanges().forEach(change=>{
+    // Track the oldest doc in this window so "Load earlier" can page further back.
+    if (!snap.empty){
+      state.oldestDocSnapshot = snap.docs[snap.docs.length - 1];
+      state.noMoreOlderMessages = snap.docs.length < LIVE_WINDOW_SIZE;
+      $("loadOlderBtn").classList.toggle("show", !state.noMoreOlderMessages);
+    }
+    // docChanges() come in DB order (desc); reverse for chronological processing.
+    const changes = snap.docChanges().slice().reverse();
+    changes.forEach(change=>{
       if (change.type === "added"){
-        renderMessage(change.doc);
-        if (!firstLoad) {
-          maybeNotify(change.doc);
+        state.messageCache.set(change.doc.id, { ...change.doc.data(), _sortTime: docSortTime(change.doc) });
+        if (!isDeletedForMe(change.doc.data())){
+          renderMessage(change.doc);
+          if (!firstLoad) maybeNotify(change.doc);
+          markDeliveredIfNeeded(change.doc);
         }
-        markDeliveredIfNeeded(change.doc);
       } else if (change.type === "modified"){
+        state.messageCache.set(change.doc.id, { ...change.doc.data(), _sortTime: docSortTime(change.doc) });
         updateMessageEl(change.doc);
-      } else if (change.type === "removed"){
-        const el = document.getElementById(`msg-${change.doc.id}`);
-        if (el) el.remove();
       }
+      // "removed" is intentionally ignored here — with a fixed-size live window,
+      // a doc can leave the result set simply because it aged out (not deleted).
+      // Real deletions are handled explicitly by our own delete/clear-chat flows,
+      // which remove DOM rows directly rather than relying on this event.
     });
     firstLoad = false;
     if (state.autoScroll) scrollToBottom();
     markVisibleMessagesSeen();
+    showEmptyStateIfNeeded();
   }, (err)=>{
     handleError("messages-listener", err);
   });
   state.unsubscribers.push(unsub);
 }
 
+function docSortTime(docSnap){
+  const data = docSnap.data();
+  return data.timestamp && data.timestamp.toDate ? data.timestamp.toDate().getTime() : Date.now();
+}
+
+function isDeletedForMe(data){
+  return Array.isArray(data.deletedFor) && data.deletedFor.includes(state.currentEmail);
+}
+
+/* ---- Infinite history: load older messages on demand ---- */
+$("loadOlderBtn").addEventListener("click", loadOlderMessages);
+async function loadOlderMessages(){
+  if (state.isLoadingOlder || state.noMoreOlderMessages || !state.oldestDocSnapshot) return;
+  state.isLoadingOlder = true;
+  const btn = $("loadOlderBtn");
+  const originalText = btn.textContent;
+  btn.textContent = "Loading…";
+  const list = $("messagesList");
+  const prevScrollHeight = list.scrollHeight;
+  try{
+    const q = query(messagesCol(), orderBy("timestamp","desc"), startAfter(state.oldestDocSnapshot), limit(100));
+    const snap = await getDocs(q);
+    if (snap.empty){
+      state.noMoreOlderMessages = true;
+      btn.classList.remove("show");
+      return;
+    }
+    state.oldestDocSnapshot = snap.docs[snap.docs.length - 1];
+    if (snap.docs.length < 100) { state.noMoreOlderMessages = true; btn.classList.remove("show"); }
+    // Prepend in chronological order (oldest first) at the very top of the list.
+    const chronological = snap.docs.slice().reverse();
+    lastRenderedDay = null; // force day dividers to be recalculated for this older batch
+    const fragment = document.createDocumentFragment();
+    chronological.forEach(docSnap=>{
+      state.messageCache.set(docSnap.id, { ...docSnap.data(), _sortTime: docSortTime(docSnap) });
+      if (!isDeletedForMe(docSnap.data())){
+        const node = buildMessageRow(docSnap);
+        if (node) fragment.appendChild(node);
+      }
+    });
+    list.prepend(fragment);
+    // Preserve scroll position so the view doesn't jump.
+    list.scrollTop = list.scrollHeight - prevScrollHeight;
+  } catch(err){
+    handleError("load-older", err);
+  } finally{
+    state.isLoadingOlder = false;
+    btn.textContent = originalText;
+  }
+}
+
+/* ---- Rendering ---- */
 let lastRenderedDay = null;
-function renderMessage(docSnap){
+
+function buildMessageRow(docSnap){
   const data = docSnap.data();
   const id = docSnap.id;
-  if (document.getElementById(`msg-${id}`)) return; // prevent duplicates
-  const list = $("messagesList");
+  if (document.getElementById(`msg-${id}`)) return null; // prevent duplicates
   const isMine = data.senderEmail === state.currentEmail;
   const ts = data.timestamp && data.timestamp.toDate ? data.timestamp.toDate() : new Date();
 
+  const nodes = document.createDocumentFragment();
   if (!lastRenderedDay || !isSameDay(lastRenderedDay, ts)){
     const divider = document.createElement("div");
     divider.className = "day-divider";
     divider.textContent = dayLabel(ts);
-    list.appendChild(divider);
+    nodes.appendChild(divider);
     lastRenderedDay = ts;
   }
 
@@ -2320,9 +2451,24 @@ function renderMessage(docSnap){
   row.dataset.sender = data.senderEmail;
   row.dataset.status = data.status || "sent";
 
+  const trigger = document.createElement("button");
+  trigger.className = "msg-actions-trigger";
+  trigger.setAttribute("aria-label","Message actions");
+  trigger.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="6" r="1.5" fill="currentColor" stroke="none"/><circle cx="12" cy="12" r="1.5" fill="currentColor" stroke="none"/><circle cx="12" cy="18" r="1.5" fill="currentColor" stroke="none"/></svg>`;
+  trigger.addEventListener("click", (e)=>{ e.stopPropagation(); openMessageActionMenu(id, trigger); });
+
   const bubble = buildBubbleContent(data, id);
-  row.appendChild(bubble);
-  list.appendChild(row);
+
+  if (isMine){ row.appendChild(trigger); row.appendChild(bubble); }
+  else { row.appendChild(bubble); row.appendChild(trigger); }
+
+  nodes.appendChild(row);
+  return nodes;
+}
+
+function renderMessage(docSnap){
+  const node = buildMessageRow(docSnap);
+  if (node) $("messagesList").appendChild(node);
 }
 
 function buildBubbleContent(data, id){
@@ -2331,18 +2477,60 @@ function buildBubbleContent(data, id){
   const bubble = document.createElement("div");
   bubble.className = "bubble";
 
-  if (data.type === "text"){
-    bubble.innerHTML = `<div class="bubble-text"></div>`;
-    bubble.querySelector(".bubble-text").textContent = data.text || ""; // safe: textContent, no HTML injection
+  // Forwarded label
+  if (data.forwarded && !data.deletedForEveryone){
+    const fwd = document.createElement("div");
+    fwd.className = "forwarded-label";
+    fwd.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:11px;height:11px;"><path d="M15 17l5-5-5-5M4 18v-2a4 4 0 014-4h12"/></svg> Forwarded`;
+    bubble.appendChild(fwd);
+  }
+
+  // Reply quote
+  if (data.replyTo && !data.deletedForEveryone){
+    const quote = document.createElement("div");
+    quote.className = "reply-quote";
+    const quoteName = data.replyTo.senderEmail === state.currentEmail ? "You" : getOtherDisplayName();
+    quote.innerHTML = `<div class="reply-quote-body"><div class="reply-quote-name"></div><div class="reply-quote-snippet"></div></div>`;
+    quote.querySelector(".reply-quote-name").textContent = quoteName;
+    quote.querySelector(".reply-quote-snippet").textContent = data.replyTo.snippet || "";
+    quote.addEventListener("click", ()=> jumpToMessage(data.replyTo.id));
+    bubble.appendChild(quote);
+  }
+
+  if (data.deletedForEveryone){
+    bubble.classList.add("bubble-deleted");
+    const del = document.createElement("div");
+    del.className = "deleted-text";
+    del.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:14px;height:14px;"><path d="M3 6h18M8 6V4a2 2 0 012-2h4a2 2 0 012 2v2m3 0v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6h14z"/></svg> This message was deleted`;
+    bubble.appendChild(del);
+  } else if (data.type === "text"){
+    const div = document.createElement("div");
+    div.className = "bubble-text";
+    div.textContent = data.text || ""; // safe: textContent, no HTML injection
+    bubble.appendChild(div);
   } else if (data.type === "image"){
     bubble.classList.add("bubble-image");
     const img = document.createElement("img");
     img.src = data.fileURL; img.loading = "lazy"; img.alt = "Shared image";
     img.addEventListener("click", ()=>openLightbox(data.fileURL));
     bubble.appendChild(img);
+  } else if (data.type === "video"){
+    bubble.classList.add("bubble-video");
+    const vid = document.createElement("video");
+    vid.src = data.fileURL; vid.controls = true; vid.preload = "metadata"; vid.playsInline = true;
+    bubble.appendChild(vid);
+  } else if (data.type === "audio"){
+    bubble.classList.add("bubble-audio");
+    const wrap = document.createElement("div");
+    wrap.innerHTML = `<audio controls preload="none"></audio><div class="audio-file-name"></div>`;
+    wrap.querySelector("audio").src = data.fileURL;
+    wrap.querySelector(".audio-file-name").textContent = data.fileName || "Audio";
+    bubble.appendChild(wrap.querySelector("audio"));
+    bubble.appendChild(wrap.querySelector(".audio-file-name"));
   } else if (data.type === "file"){
     bubble.classList.add("bubble-file");
-    bubble.innerHTML = `
+    const wrap = document.createElement("div");
+    wrap.innerHTML = `
       <div class="file-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><path d="M14 2v6h6"/></svg></div>
       <div class="file-meta">
         <div class="file-name"></div>
@@ -2350,34 +2538,31 @@ function buildBubbleContent(data, id){
       </div>
       <a class="file-dl" target="_blank" rel="noopener noreferrer"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4M7 10l5 5 5-5M12 15V3"/></svg></a>
     `;
-    bubble.querySelector(".file-name").textContent = data.fileName || "File";
-    bubble.querySelector(".file-size").textContent = formatBytes(data.fileSize||0);
-    const dl = bubble.querySelector(".file-dl");
+    wrap.querySelector(".file-name").textContent = data.fileName || "File";
+    wrap.querySelector(".file-size").textContent = formatBytes(data.fileSize||0);
+    const dl = wrap.querySelector(".file-dl");
     dl.href = data.fileURL;
     dl.setAttribute("download", data.fileName || "file");
+    Array.from(wrap.children).forEach(c=> bubble.appendChild(c));
   } else if (data.type === "voice"){
     bubble.classList.add("bubble-voice");
-    const bars = Array.from({length:24}, ()=>`<span style="height:${6+Math.round(Math.random()*16)}px"></span>`).join("");
-    bubble.innerHTML = `
+    const seed = data.waveform && Array.isArray(data.waveform) ? data.waveform : Array.from({length:24}, ()=>6+Math.round(Math.random()*16));
+    const bars = seed.map(h=>`<span style="height:${h}px"></span>`).join("");
+    const wrap = document.createElement("div");
+    wrap.innerHTML = `
       <button class="voice-play"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg></button>
       <div class="voice-wave">${bars}</div>
       <div class="voice-dur">${formatDuration(data.duration||0)}</div>
     `;
+    Array.from(wrap.children).forEach(c=> bubble.appendChild(c));
     bubble.querySelector(".voice-play").addEventListener("click", (e)=>playVoiceMessage(data.fileURL, e.currentTarget));
   }
 
-  if (data.type === "image" || data.type === "file" || data.type === "voice"){
-    if (data.type !== "text"){
-      const meta = document.createElement("div");
-      meta.className = "bubble-meta";
-      meta.innerHTML = `<span class="msg-time">${formatTime(ts)}</span>`;
-      if (isMine) meta.appendChild(buildTicks(data.status));
-      bubble.appendChild(meta);
-    }
-  } else {
+  if (!data.deletedForEveryone){
     const meta = document.createElement("div");
     meta.className = "bubble-meta";
-    meta.innerHTML = `<span class="msg-time">${formatTime(ts)}</span>`;
+    const isFav = Array.isArray(data.favoritedBy) && data.favoritedBy.includes(state.currentEmail);
+    meta.innerHTML = `<span class="msg-time">${formatTime(ts)}</span>${data.edited ? '<span class="edited-label">edited</span>' : ""}${isFav ? '<span class="favorite-star">★</span>' : ""}`;
     if (isMine) meta.appendChild(buildTicks(data.status));
     bubble.appendChild(meta);
   }
@@ -2397,15 +2582,23 @@ function buildTicks(status){
 
 function updateMessageEl(docSnap){
   const id = docSnap.id;
-  const row = document.getElementById(`msg-${id}`);
-  if (!row) return;
   const data = docSnap.data();
-  row.dataset.status = data.status || "sent";
-  const ticksEl = row.querySelector(".ticks");
-  if (ticksEl){
-    const fresh = buildTicks(data.status);
-    ticksEl.replaceWith(fresh);
+  if (isDeletedForMe(data)){
+    const row = document.getElementById(`msg-${id}`);
+    if (row) row.remove();
+    return;
   }
+  const row = document.getElementById(`msg-${id}`);
+  if (!row){
+    // Wasn't rendered before (e.g. was hidden) — render it now if appropriate.
+    renderMessage(docSnap);
+    return;
+  }
+  row.dataset.status = data.status || "sent";
+  const oldBubble = row.querySelector(".bubble");
+  const newBubble = buildBubbleContent(data, id);
+  if (oldBubble) oldBubble.replaceWith(newBubble); else row.appendChild(newBubble);
+  if (state.pinnedMessageId === id) renderPinBanner();
 }
 
 async function markDeliveredIfNeeded(docSnap){
@@ -2444,12 +2637,8 @@ function maybeNotify(docSnap){
   state.unreadCount++;
   updateUnreadBadge(state.unreadCount);
   const name = getOtherDisplayName();
-  let body = "Sent a message";
-  if (data.type === "text") body = data.text;
-  else if (data.type === "image") body = "📷 Photo";
-  else if (data.type === "file") body = `📎 ${data.fileName||"File"}`;
-  else if (data.type === "voice") body = "🎤 Voice message";
-  showDesktopNotification(name, body);
+  playNotificationSound();
+  showDesktopNotification(name, messageSnippet(data));
 }
 
 function updateUnreadBadge(n){
@@ -2470,6 +2659,7 @@ listEl.addEventListener("scroll", ()=>{
   const nearBottom = listEl.scrollHeight - listEl.scrollTop - listEl.clientHeight < 80;
   state.autoScroll = nearBottom;
   $("scrollFab").classList.toggle("show", !nearBottom);
+  if (listEl.scrollTop < 120 && !state.noMoreOlderMessages) loadOlderMessages();
 });
 $("scrollFab").addEventListener("click", ()=>{
   scrollToBottom();
@@ -2495,10 +2685,419 @@ function playVoiceMessage(url, btn){
 
 function openLightbox(url){
   $("lightboxImg").src = url;
+  $("lightboxDownload").href = url;
+  $("lightboxImg").style.transform = "scale(1)";
   $("lightbox").classList.add("show");
 }
 $("lightboxClose").addEventListener("click", ()=> $("lightbox").classList.remove("show"));
 $("lightbox").addEventListener("click", (e)=>{ if (e.target.id==="lightbox") $("lightbox").classList.remove("show"); });
+// Zoom: scroll wheel to zoom in/out, double-click to toggle 1x/2.5x.
+let lightboxZoom = 1;
+$("lightbox").addEventListener("wheel", (e)=>{
+  if (!$("lightbox").classList.contains("show")) return;
+  e.preventDefault();
+  lightboxZoom = Math.min(4, Math.max(1, lightboxZoom - e.deltaY * 0.0015));
+  $("lightboxImg").style.transform = `scale(${lightboxZoom})`;
+}, { passive:false });
+$("lightboxImg").addEventListener("dblclick", ()=>{
+  lightboxZoom = lightboxZoom > 1 ? 1 : 2.5;
+  $("lightboxImg").style.transform = `scale(${lightboxZoom})`;
+});
+
+/* =====================================================================
+   MESSAGE ACTIONS — reply, copy, forward, edit, pin, favorite, delete
+   ===================================================================== */
+function messageSnippet(data){
+  if (data.deletedForEveryone) return "This message was deleted";
+  if (data.type === "text") return data.text || "";
+  if (data.type === "image") return "📷 Photo";
+  if (data.type === "video") return "🎬 Video";
+  if (data.type === "audio") return `🎵 ${data.fileName || "Audio"}`;
+  if (data.type === "file") return `📎 ${data.fileName||"File"}`;
+  if (data.type === "voice") return "🎤 Voice message";
+  return "Message";
+}
+
+function jumpToMessage(id){
+  const row = document.getElementById(`msg-${id}`);
+  if (!row) return showToast("Original message not loaded", "info", 2000);
+  row.scrollIntoView({ behavior:"smooth", block:"center" });
+  row.style.transition = "background .3s";
+  const bubble = row.querySelector(".bubble");
+  if (bubble){
+    const original = bubble.style.boxShadow;
+    bubble.style.boxShadow = "0 0 0 2px var(--accent-a)";
+    setTimeout(()=>{ bubble.style.boxShadow = original; }, 900);
+  }
+}
+
+function openMessageActionMenu(id, anchorEl){
+  const data = state.messageCache.get(id);
+  if (!data) return;
+  const isMine = data.senderEmail === state.currentEmail;
+  const isDeleted = !!data.deletedForEveryone;
+  const isFav = Array.isArray(data.favoritedBy) && data.favoritedBy.includes(state.currentEmail);
+  const isPinned = state.pinnedMessageId === id;
+
+  const items = [];
+  if (!isDeleted){
+    items.push({ action:"reply", label:"Reply", icon:`<path d="M9 17l-5-5 5-5M4 12h11a4 4 0 010 8h-1"/>` });
+    if (data.type === "text" || data.fileURL){
+      items.push({ action:"copy", label: data.type === "text" ? "Copy text" : "Copy link", icon:`<rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/>` });
+      items.push({ action:"forward", label:"Forward", icon:`<path d="M15 17l5-5-5-5M4 18v-2a4 4 0 014-4h12"/>` });
+    }
+    if (isMine && data.type === "text"){
+      items.push({ action:"edit", label:"Edit", icon:`<path d="M17 3a2.85 2.83 0 114 4L7.5 20.5 2 22l1.5-5.5L17 3z"/>` });
+    }
+    items.push({ action:"pin", label: isPinned ? "Unpin" : "Pin", icon:`<path d="M12 2l1.5 5.5L19 9l-4 3.5L16 18l-4-3-4 3 1-5.5-4-3.5 5.5-1.5z"/>` });
+    items.push({ action:"favorite", label: isFav ? "Remove favorite" : "Favorite", icon:`<path d="M12 2l3 7 7 .5-5.5 4.5L18 21l-6-4-6 4 1.5-7L2 9.5 9 9z"/>` });
+  }
+  items.push({ action:"delete-me", label:"Delete for me", icon:`<path d="M3 6h18M8 6V4a2 2 0 012-2h4a2 2 0 012 2v2m3 0v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6h14z"/>`, danger:true });
+  if (isMine && !isDeleted){
+    items.push({ action:"delete-everyone", label:"Delete for everyone", icon:`<path d="M3 6h18M8 6V4a2 2 0 012-2h4a2 2 0 012 2v2m3 0v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6h14z"/>`, danger:true });
+  }
+
+  const menu = $("msgActionMenu");
+  menu.innerHTML = items.map(it=>
+    `<button data-action="${it.action}"${it.danger ? ' class="danger-text"' : ""}><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">${it.icon}</svg>${it.label}</button>`
+  ).join("");
+  menu.dataset.msgId = id;
+
+  const rect = anchorEl.getBoundingClientRect();
+  menu.style.display = "flex"; // measure first
+  const menuRect = menu.getBoundingClientRect();
+  let top = rect.bottom + 6;
+  let left = rect.left - menuRect.width + rect.width;
+  if (top + menuRect.height > window.innerHeight - 10) top = rect.top - menuRect.height - 6;
+  if (left < 10) left = 10;
+  if (left + menuRect.width > window.innerWidth - 10) left = window.innerWidth - menuRect.width - 10;
+  menu.style.top = `${Math.max(10, top)}px`;
+  menu.style.left = `${left}px`;
+  menu.classList.add("show");
+}
+function closeMessageActionMenu(){
+  const menu = $("msgActionMenu");
+  menu.classList.remove("show");
+  menu.style.display = "";
+}
+$("msgActionMenu").addEventListener("click", (e)=>{
+  const btn = e.target.closest("[data-action]");
+  if (!btn) return;
+  const id = $("msgActionMenu").dataset.msgId;
+  const action = btn.dataset.action;
+  closeMessageActionMenu();
+  handleMessageAction(action, id);
+});
+document.addEventListener("click", (e)=>{
+  if ($("msgActionMenu").classList.contains("show") && !$("msgActionMenu").contains(e.target) && !e.target.closest(".msg-actions-trigger")){
+    closeMessageActionMenu();
+  }
+});
+document.addEventListener("keydown", (e)=>{
+  if (e.key === "Escape"){
+    closeMessageActionMenu();
+    if ($("lightbox").classList.contains("show")) $("lightbox").classList.remove("show");
+    if ($("settingsModal").classList.contains("show")) $("settingsModal").classList.remove("show");
+    if (state.searchActive) closeSearch();
+  }
+  // Ctrl/Cmd+F opens in-chat search instead of the browser's native find bar.
+  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "f" && document.getElementById("chatScreen").classList.contains("active")){
+    e.preventDefault();
+    openSearch();
+  }
+});
+
+function handleMessageAction(action, id){
+  const data = state.messageCache.get(id);
+  if (!data) return;
+  switch(action){
+    case "reply": startReply(id, data); break;
+    case "copy": copyMessageContent(data); break;
+    case "forward": forwardMessage(data); break;
+    case "edit": startEdit(id, data); break;
+    case "pin": togglePin(id); break;
+    case "favorite": toggleFavorite(id, data); break;
+    case "delete-me": deleteForMe(id); break;
+    case "delete-everyone": deleteForEveryone(id); break;
+  }
+}
+
+function startReply(id, data){
+  state.editingMessageId = null;
+  state.replyingTo = { id, senderEmail: data.senderEmail, snippet: messageSnippet(data).slice(0,140) };
+  const who = data.senderEmail === state.currentEmail ? "yourself" : getOtherDisplayName();
+  showComposerContext("reply", `Replying to ${who}`, state.replyingTo.snippet);
+  $("messageInput").focus();
+}
+
+function startEdit(id, data){
+  if (data.senderEmail !== state.currentEmail || data.type !== "text") return;
+  state.replyingTo = null;
+  state.editingMessageId = id;
+  $("messageInput").value = data.text || "";
+  autoResizeInput();
+  toggleSendButton();
+  showComposerContext("edit", "Editing message", data.text || "");
+  $("messageInput").focus();
+}
+
+function copyMessageContent(data){
+  const text = data.type === "text" ? (data.text || "") : (data.fileURL || "");
+  if (!text) return;
+  if (navigator.clipboard && navigator.clipboard.writeText){
+    navigator.clipboard.writeText(text).then(()=> showToast("Copied to clipboard", "success", 1500))
+      .catch(()=> showToast("Couldn't copy — try selecting the text manually", "error"));
+  } else {
+    showToast("Clipboard not available in this browser", "warning");
+  }
+}
+
+async function forwardMessage(data){
+  if (!requireAuth()) return;
+  try{
+    const payload = {
+      type: data.type,
+      senderEmail: state.currentEmail,
+      recipientEmail: state.otherEmail,
+      status: "sent",
+      timestamp: serverTimestamp(),
+      forwarded: true,
+      forwardedFrom: data.senderEmail
+    };
+    if (data.type === "text") payload.text = data.text;
+    if (data.fileURL) payload.fileURL = data.fileURL;
+    if (data.fileName) payload.fileName = data.fileName;
+    if (data.fileSize) payload.fileSize = data.fileSize;
+    if (data.duration != null) payload.duration = data.duration;
+    if (data.waveform) payload.waveform = data.waveform;
+    await addDoc(messagesCol(), payload);
+    showToast("Message forwarded", "success", 1800);
+  } catch(err){
+    handleError("forward", err);
+  }
+}
+
+async function togglePin(id){
+  if (!requireAuth()) return;
+  const isPinned = state.pinnedMessageId === id;
+  try{
+    await setDoc(doc(db,"settings","chat"), {
+      pinnedMessageId: isPinned ? null : id,
+      pinnedBy: state.currentEmail,
+      pinnedAt: serverTimestamp()
+    }, { merge:true });
+  } catch(err){ handleError("pin", err); }
+}
+
+async function toggleFavorite(id, data){
+  if (!requireAuth()) return;
+  const isFav = Array.isArray(data.favoritedBy) && data.favoritedBy.includes(state.currentEmail);
+  try{
+    await updateDoc(doc(db,"messages",id), {
+      favoritedBy: isFav ? arrayRemove(state.currentEmail) : arrayUnion(state.currentEmail)
+    });
+  } catch(err){ handleError("favorite", err); }
+}
+
+async function deleteForMe(id){
+  if (!requireAuth()) return;
+  try{
+    await updateDoc(doc(db,"messages",id), { deletedFor: arrayUnion(state.currentEmail) });
+    const row = document.getElementById(`msg-${id}`);
+    if (row) row.remove();
+    showEmptyStateIfNeeded();
+  } catch(err){ handleError("delete", err); }
+}
+
+async function deleteForEveryone(id){
+  const data = state.messageCache.get(id);
+  if (!data || data.senderEmail !== state.currentEmail) return;
+  if (!requireAuth()) return;
+  try{
+    await updateDoc(doc(db,"messages",id), {
+      deletedForEveryone: true, text:"", fileURL:null, fileName:null, fileSize:null, duration:null
+    });
+    if (state.pinnedMessageId === id) togglePin(id); // auto-unpin deleted content
+  } catch(err){ handleError("delete", err); }
+}
+
+/* ---- Pin banner (shared) ---- */
+async function renderPinBanner(){
+  const bar = $("pinBanner");
+  if (!state.pinnedMessageId){ bar.classList.remove("show"); return; }
+  let data = state.messageCache.get(state.pinnedMessageId);
+  if (!data){
+    try{
+      const snap = await getDoc(doc(db,"messages",state.pinnedMessageId));
+      if (snap.exists()){ data = snap.data(); state.messageCache.set(state.pinnedMessageId, data); }
+    } catch(e){ /* ignore */ }
+  }
+  if (!data){ bar.classList.remove("show"); return; }
+  $("pinBannerText").textContent = messageSnippet(data);
+  bar.classList.add("show");
+}
+$("pinJumpBtn").addEventListener("click", ()=>{ if (state.pinnedMessageId) jumpToMessage(state.pinnedMessageId); });
+$("pinRemoveBtn").addEventListener("click", ()=>{ if (state.pinnedMessageId) togglePin(state.pinnedMessageId); });
+
+/* =====================================================================
+   MESSAGE SEARCH
+   ===================================================================== */
+$("searchBtn").addEventListener("click", ()=> state.searchActive ? closeSearch() : openSearch());
+function openSearch(){
+  state.searchActive = true;
+  $("searchBar").classList.add("show");
+  $("searchInput").value = "";
+  $("searchInput").focus();
+  clearSearchHighlights();
+  updateSearchCount();
+}
+function closeSearch(){
+  state.searchActive = false;
+  $("searchBar").classList.remove("show");
+  clearSearchHighlights();
+}
+$("searchCloseBtn").addEventListener("click", closeSearch);
+$("searchInput").addEventListener("input", debounce(runSearch, 220));
+$("searchInput").addEventListener("keydown", (e)=>{
+  if (e.key === "Enter"){ e.preventDefault(); e.shiftKey ? goToPrevMatch() : goToNextMatch(); }
+});
+$("searchPrevBtn").addEventListener("click", goToPrevMatch);
+$("searchNextBtn").addEventListener("click", goToNextMatch);
+
+function clearSearchHighlights(){
+  document.querySelectorAll(".search-hit").forEach(el=> el.classList.remove("search-hit","search-current"));
+  state.searchMatches = [];
+  state.searchIndex = -1;
+}
+function runSearch(){
+  const term = $("searchInput").value.trim().toLowerCase();
+  clearSearchHighlights();
+  if (!term){ updateSearchCount(); return; }
+  const matches = [];
+  state.messageCache.forEach((data, id)=>{
+    if (!data.deletedForEveryone && data.type === "text" && data.text && data.text.toLowerCase().includes(term)){
+      matches.push(id);
+    }
+  });
+  matches.sort((a,b)=> (state.messageCache.get(a)._sortTime||0) - (state.messageCache.get(b)._sortTime||0));
+  state.searchMatches = matches;
+  state.searchIndex = matches.length ? matches.length - 1 : -1; // start from most recent
+  highlightMatches();
+  updateSearchCount();
+}
+function highlightMatches(){
+  state.searchMatches.forEach((id, i)=>{
+    const row = document.getElementById(`msg-${id}`);
+    const textEl = row && row.querySelector(".bubble-text");
+    if (textEl){
+      textEl.classList.add("search-hit");
+      if (i === state.searchIndex) textEl.classList.add("search-current");
+    }
+  });
+  if (state.searchIndex >= 0){
+    const row = document.getElementById(`msg-${state.searchMatches[state.searchIndex]}`);
+    if (row) row.scrollIntoView({ behavior:"smooth", block:"center" });
+  }
+}
+function goToPrevMatch(){
+  if (!state.searchMatches.length) return;
+  document.querySelectorAll(".search-current").forEach(el=>el.classList.remove("search-current"));
+  state.searchIndex = (state.searchIndex - 1 + state.searchMatches.length) % state.searchMatches.length;
+  highlightMatches(); updateSearchCount();
+}
+function goToNextMatch(){
+  if (!state.searchMatches.length) return;
+  document.querySelectorAll(".search-current").forEach(el=>el.classList.remove("search-current"));
+  state.searchIndex = (state.searchIndex + 1) % state.searchMatches.length;
+  highlightMatches(); updateSearchCount();
+}
+function updateSearchCount(){
+  $("searchCount").textContent = state.searchMatches.length ? `${state.searchIndex+1}/${state.searchMatches.length}` : "0/0";
+}
+
+/* =====================================================================
+   EMOJI PICKER
+   ===================================================================== */
+const EMOJI_SET = ["😀","😁","😂","🤣","😊","😍","😘","😗","😉","😎","🤩","🥳","😇","🙂","🙃","😏","😌","😴","🤤","😜","🤪","😋","🤗","🤔","🤨","😐","😶","🙄","😬","😳","😢","😭","😤","😡","🥺","😱","😨","😰","🥰","😻","👍","👎","👏","🙌","🤝","🙏","💪","👀","🔥","✨","🎉","🎊","💯","💔","❤️","🧡","💛","💚","💙","💜","🖤","🤍","💕","💞","💗","💖","💘","💋","😺","🐱","🌹","🌸","☀️","🌙","⭐","🍕","🍔","🍰","☕","🍷","🎂","🎁","📷","🎵","⚽","🏆","✈️","🏠","💤"];
+function buildEmojiPicker(){
+  $("emojiPicker").innerHTML = EMOJI_SET.map(e=>`<button type="button">${e}</button>`).join("");
+}
+buildEmojiPicker();
+$("emojiBtn").addEventListener("click", (e)=>{
+  e.stopPropagation();
+  $("emojiPicker").classList.toggle("show");
+});
+$("emojiPicker").addEventListener("click", (e)=>{
+  const btn = e.target.closest("button");
+  if (!btn) return;
+  const input = $("messageInput");
+  const start = input.selectionStart ?? input.value.length;
+  const end = input.selectionEnd ?? input.value.length;
+  input.value = input.value.slice(0, start) + btn.textContent + input.value.slice(end);
+  input.selectionStart = input.selectionEnd = start + btn.textContent.length;
+  input.focus();
+  autoResizeInput();
+  toggleSendButton();
+});
+document.addEventListener("click", (e)=>{
+  if (!$("emojiPicker").contains(e.target) && e.target !== $("emojiBtn") && !e.target.closest("#emojiBtn")){
+    $("emojiPicker").classList.remove("show");
+  }
+});
+
+/* =====================================================================
+   NOTIFICATION SOUND
+   ===================================================================== */
+function playNotificationSound(){
+  if (!state.soundEnabled) return;
+  try{
+    const ctx = new (window.AudioContext || window.webkitAudioContext)();
+    const o = ctx.createOscillator();
+    const g = ctx.createGain();
+    o.type = "sine"; o.frequency.value = 880;
+    g.gain.setValueAtTime(0.001, ctx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.15, ctx.currentTime + 0.02);
+    g.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.35);
+    o.connect(g); g.connect(ctx.destination);
+    o.start(); o.stop(ctx.currentTime + 0.4);
+    o.onended = ()=> ctx.close();
+  } catch(e){ /* audio not available, non-critical */ }
+}
+
+/* =====================================================================
+   DRAG & DROP / PASTE
+   ===================================================================== */
+["dragover","dragenter"].forEach(evt=>{
+  $("messagesWrap").addEventListener(evt, (e)=>{ e.preventDefault(); $("messagesWrap").classList.add("drag-over"); });
+});
+["dragleave","drop"].forEach(evt=>{
+  $("messagesWrap").addEventListener(evt, (e)=>{ e.preventDefault(); $("messagesWrap").classList.remove("drag-over"); });
+});
+$("messagesWrap").addEventListener("drop", (e)=>{
+  const files = Array.from(e.dataTransfer.files || []);
+  if (!files.length) return;
+  routeDroppedFile(files[0]);
+});
+$("messageInput").addEventListener("paste", (e)=>{
+  const items = Array.from(e.clipboardData?.items || []);
+  const imageItem = items.find(it=> it.type && it.type.startsWith("image/"));
+  if (imageItem){
+    e.preventDefault();
+    const file = imageItem.getAsFile();
+    if (file) routeDroppedFile(file);
+  }
+});
+function routeDroppedFile(file){
+  if (ALLOWED_IMAGE_TYPES.includes(file.type)){
+    handleSelectedImage(file);
+  } else if (file.type.startsWith("video/")){
+    handleSelectedVideo(file);
+  } else if (file.type.startsWith("audio/")){
+    handleSelectedAudio(file);
+  } else {
+    handleSelectedDoc(file);
+  }
+}
 
 /* =====================================================================
    SECTION 12 — IMAGE / FILE UPLOAD
@@ -2513,12 +3112,17 @@ document.addEventListener("click", (e)=>{
   }
 });
 $("attachImage").addEventListener("click", ()=>{ $("attachMenu").classList.remove("show"); $("imageFileInput").click(); });
+$("attachVideo").addEventListener("click", ()=>{ $("attachMenu").classList.remove("show"); $("videoFileInput").click(); });
+$("attachAudio").addEventListener("click", ()=>{ $("attachMenu").classList.remove("show"); $("audioFileInput").click(); });
 $("attachFile").addEventListener("click", ()=>{ $("attachMenu").classList.remove("show"); $("docFileInput").click(); });
 
+/* ---- Image ---- */
 $("imageFileInput").addEventListener("change", (e)=>{
   const file = e.target.files[0];
   e.target.value = "";
-  if (!file) return;
+  if (file) handleSelectedImage(file);
+});
+function handleSelectedImage(file){
   if (!ALLOWED_IMAGE_TYPES.includes(file.type)){
     return showErrorDialog("Unsupported file type", "Please choose a JPG, PNG, GIF, or WEBP image.");
   }
@@ -2532,8 +3136,7 @@ $("imageFileInput").addEventListener("change", (e)=>{
     $("imagePreviewModal").classList.add("show");
   };
   reader.readAsDataURL(file);
-});
-
+}
 $("previewCancelBtn").addEventListener("click", ()=>{
   state.pendingImageFile = null;
   $("imagePreviewModal").classList.remove("show");
@@ -2541,14 +3144,85 @@ $("previewCancelBtn").addEventListener("click", ()=>{
 $("previewSendBtn").addEventListener("click", async ()=>{
   if (!state.pendingImageFile) return;
   $("imagePreviewModal").classList.remove("show");
-  await uploadAndSend(state.pendingImageFile, "image");
+  const file = state.pendingImageFile;
   state.pendingImageFile = null;
+  const compressed = await compressImageIfNeeded(file);
+  await uploadAndSend(compressed, "image");
 });
 
+/* ---- Video ---- */
+$("videoFileInput").addEventListener("change", (e)=>{
+  const file = e.target.files[0];
+  e.target.value = "";
+  if (file) handleSelectedVideo(file);
+});
+function handleSelectedVideo(file){
+  if (!file.type.startsWith("video/")){
+    return showErrorDialog("Unsupported file type", "Please choose a video file.");
+  }
+  if (file.size > MAX_VIDEO_MB*1024*1024){
+    return showErrorDialog("Video too large", `Please choose a video smaller than ${MAX_VIDEO_MB}MB.`);
+  }
+  state.pendingVideoFile = file;
+  if (state.pendingVideoURL) URL.revokeObjectURL(state.pendingVideoURL);
+  state.pendingVideoURL = URL.createObjectURL(file);
+  $("previewVideoEl").src = state.pendingVideoURL;
+  $("videoPreviewModal").classList.add("show");
+}
+$("videoCancelPreviewBtn").addEventListener("click", ()=>{
+  $("previewVideoEl").pause();
+  $("previewVideoEl").src = "";
+  if (state.pendingVideoURL){ URL.revokeObjectURL(state.pendingVideoURL); state.pendingVideoURL = null; }
+  state.pendingVideoFile = null;
+  $("videoPreviewModal").classList.remove("show");
+});
+$("videoSendPreviewBtn").addEventListener("click", async ()=>{
+  if (!state.pendingVideoFile) return;
+  $("videoPreviewModal").classList.remove("show");
+  const file = state.pendingVideoFile;
+  state.pendingVideoFile = null;
+  $("previewVideoEl").pause(); $("previewVideoEl").src = "";
+  if (state.pendingVideoURL){ URL.revokeObjectURL(state.pendingVideoURL); state.pendingVideoURL = null; }
+  await uploadAndSend(file, "video");
+});
+
+/* ---- Audio (as a file, distinct from voice recordings) ---- */
+$("audioFileInput").addEventListener("change", (e)=>{
+  const file = e.target.files[0];
+  e.target.value = "";
+  if (file) handleSelectedAudio(file);
+});
+function handleSelectedAudio(file){
+  if (!file.type.startsWith("audio/")){
+    return showErrorDialog("Unsupported file type", "Please choose an audio file.");
+  }
+  if (file.size > MAX_FILE_MB*1024*1024){
+    return showErrorDialog("File too large", `Please choose a file smaller than ${MAX_FILE_MB}MB.`);
+  }
+  state.pendingAudioFile = file;
+  $("previewAudioName").textContent = file.name;
+  $("previewAudioSize").textContent = formatBytes(file.size);
+  $("audioPreviewModal").classList.add("show");
+}
+$("audioCancelPreviewBtn").addEventListener("click", ()=>{
+  state.pendingAudioFile = null;
+  $("audioPreviewModal").classList.remove("show");
+});
+$("audioSendPreviewBtn").addEventListener("click", async ()=>{
+  if (!state.pendingAudioFile) return;
+  $("audioPreviewModal").classList.remove("show");
+  const file = state.pendingAudioFile;
+  state.pendingAudioFile = null;
+  await uploadAndSend(file, "audio");
+});
+
+/* ---- Documents ---- */
 $("docFileInput").addEventListener("change", (e)=>{
   const file = e.target.files[0];
   e.target.value = "";
-  if (!file) return;
+  if (file) handleSelectedDoc(file);
+});
+function handleSelectedDoc(file){
   const ext = fileExt(file.name);
   if (!ALLOWED_FILE_EXT.includes(ext)){
     return showErrorDialog("Unsupported file type", `Allowed types: ${ALLOWED_FILE_EXT.join(", ")}`);
@@ -2560,7 +3234,7 @@ $("docFileInput").addEventListener("change", (e)=>{
   $("previewFileName").textContent = file.name;
   $("previewFileSize").textContent = formatBytes(file.size);
   $("filePreviewModal").classList.add("show");
-});
+}
 $("fileCancelBtn").addEventListener("click", ()=>{
   state.pendingDocFile = null;
   $("filePreviewModal").classList.remove("show");
@@ -2568,52 +3242,88 @@ $("fileCancelBtn").addEventListener("click", ()=>{
 $("fileSendBtn").addEventListener("click", async ()=>{
   if (!state.pendingDocFile) return;
   $("filePreviewModal").classList.remove("show");
-  await uploadAndSend(state.pendingDocFile, "file");
+  const file = state.pendingDocFile;
   state.pendingDocFile = null;
+  await uploadAndSend(file, "file");
 });
 
+/* ---- Image compression (client-side, before upload) ---- */
+async function compressImageIfNeeded(file){
+  // Skip GIFs (animation would be destroyed by canvas re-encoding) and
+  // already-small files.
+  if (file.type === "image/gif" || file.size < 350 * 1024) return file;
+  try{
+    const bitmap = await createImageBitmap(file);
+    const MAX_DIM = 1600;
+    let { width, height } = bitmap;
+    if (width <= MAX_DIM && height <= MAX_DIM) { bitmap.close && bitmap.close(); return file; }
+    const scale = MAX_DIM / Math.max(width, height);
+    width = Math.round(width * scale); height = Math.round(height * scale);
+    const canvas = document.createElement("canvas");
+    canvas.width = width; canvas.height = height;
+    const ctx = canvas.getContext("2d");
+    ctx.drawImage(bitmap, 0, 0, width, height);
+    bitmap.close && bitmap.close();
+    const blob = await new Promise(resolve => canvas.toBlob(resolve, "image/jpeg", 0.82));
+    if (!blob || blob.size >= file.size) return file; // compression didn't help, keep original
+    return new File([blob], file.name.replace(/\.\w+$/, ".jpg"), { type: "image/jpeg" });
+  } catch(e){
+    console.warn("Image compression skipped:", e);
+    return file; // fall back to the original file — never block sending over this
+  }
+}
+
+/* ---- Core upload pipeline (shared by image/video/audio/file) ---- */
 async function uploadAndSend(file, type){
   if (!requireAuth()) return;
   if (!navigator.onLine){
     showErrorDialog("No internet connection", "Connect to the internet to send files.");
     return;
   }
+  if (state.isUploading){
+    showToast("Please wait for the current upload to finish", "warning", 2000);
+    return;
+  }
+  state.isUploading = true;
   const tempId = `upload-${Date.now()}`;
   const row = createUploadingRow(tempId, file, type);
   $("messagesList").appendChild(row);
   scrollToBottom();
 
   try{
+    const folder = type === "image" ? "uploads" : type === "video" ? "videos" : type === "audio" ? "audiofiles" : "uploads";
     const safeName = `${Date.now()}_${sanitizeFileName(file.name)}`;
-    const path = `uploads/${state.currentEmail}/${safeName}`;
+    const path = `${folder}/${state.currentEmail}/${safeName}`;
     const storageRef = ref(storage, path);
     const task = uploadBytesResumable(storageRef, file, { contentType: file.type || undefined });
 
-    task.on("state_changed", (snap)=>{
-      const pct = Math.round((snap.bytesTransferred/snap.totalBytes)*100);
-      const fill = row.querySelector(".upload-progress-fill");
-      if (fill) fill.style.width = pct + "%";
-    }, (err)=>{
-      row.remove();
-      handleError("upload", err);
-    }, async ()=>{
-      const url = await getDownloadURL(task.snapshot.ref);
-      row.remove();
-      const payload = {
-        type,
-        senderEmail: state.currentEmail,
-        recipientEmail: state.otherEmail,
-        status: "sent",
-        timestamp: serverTimestamp(),
-        fileURL: url,
-        fileName: sanitizeText(file.name),
-        fileSize: file.size
-      };
-      await addDoc(messagesCol(), payload);
+    await new Promise((resolve, reject)=>{
+      task.on("state_changed", (snap)=>{
+        const pct = Math.round((snap.bytesTransferred/snap.totalBytes)*100);
+        const fill = row.querySelector(".upload-progress-fill");
+        if (fill) fill.style.width = pct + "%";
+      }, reject, resolve);
     });
+
+    const url = await getDownloadURL(task.snapshot.ref);
+    row.remove();
+    const payload = {
+      type,
+      senderEmail: state.currentEmail,
+      recipientEmail: state.otherEmail,
+      status: "sent",
+      timestamp: serverTimestamp(),
+      fileURL: url,
+      fileName: sanitizeText(file.name),
+      fileSize: file.size
+    };
+    if (state.replyingTo){ payload.replyTo = state.replyingTo; hideComposerContext(); }
+    await addDoc(messagesCol(), payload);
   } catch(err){
     row.remove();
     handleError("upload", err);
+  } finally{
+    state.isUploading = false;
   }
 }
 
@@ -2627,10 +3337,11 @@ function createUploadingRow(id, file, type){
   row.id = id;
   const bubble = document.createElement("div");
   bubble.className = "bubble upload-progress-wrap";
+  const label = type === "image" ? "Uploading photo…" : type === "video" ? "Uploading video…" : type === "audio" ? "Uploading audio…" : "Uploading " + escapeHtml(file.name);
   bubble.innerHTML = `
     <div style="display:flex; align-items:center; gap:8px;">
       <div class="spinner" style="width:14px;height:14px; border-width:2px;"></div>
-      <span style="font-size:13px;">${type==="image" ? "Uploading photo…" : "Uploading "+escapeHtml(file.name)}</span>
+      <span style="font-size:13px;">${label}</span>
     </div>
     <div class="upload-progress-bar"><div class="upload-progress-fill" style="width:0%"></div></div>
   `;
@@ -2644,9 +3355,12 @@ function createUploadingRow(id, file, type){
 $("micBtn").addEventListener("click", async ()=>{
   if (!state.mediaRecorder || state.mediaRecorder.state === "inactive"){
     await startRecording();
+  } else if (state.mediaRecorder.state === "recording"){
+    stopRecording(false);
   }
 });
 $("recCancel").addEventListener("click", ()=> stopRecording(true));
+$("micBtn").addEventListener("contextmenu", e=>e.preventDefault());
 
 async function startRecording(){
   if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia){
@@ -2655,25 +3369,69 @@ async function startRecording(){
   try{
     const stream = await navigator.mediaDevices.getUserMedia({ audio:true });
     state.recordedChunks = [];
+    state.pausedElapsedMs = 0;
+    state.pauseStartedAt = null;
     const mimeType = MediaRecorder.isTypeSupported("audio/webm") ? "audio/webm" : "audio/mp4";
     state.mediaRecorder = new MediaRecorder(stream, { mimeType });
     state.mediaRecorder.ondataavailable = (e)=>{ if (e.data.size>0) state.recordedChunks.push(e.data); };
     state.mediaRecorder.onstop = ()=>{
       stream.getTracks().forEach(t=>t.stop());
+      teardownWaveformAnalyser();
     };
     state.mediaRecorder.start();
     state.recordingStartTime = Date.now();
+    state.recordedWaveform = [];
     $("recordingBar").classList.add("active");
     $("composerInputWrap").style.display = "none";
     buildRecWaveBars();
+    setupWaveformAnalyser(stream);
+    setRecPauseIcon(false);
     state.recordingTimerInterval = setInterval(()=>{
-      const elapsed = (Date.now()-state.recordingStartTime)/1000;
+      if (state.mediaRecorder.state === "paused") return;
+      const elapsed = (Date.now()-state.recordingStartTime-state.pausedElapsedMs)/1000;
       $("recTimer").textContent = formatDuration(elapsed);
       if (elapsed >= MAX_VOICE_SECONDS) stopRecording(false);
     }, 200);
   } catch(err){
     handleError("microphone", err);
   }
+}
+
+/* ---- Pause / resume ---- */
+$("recPauseBtn").addEventListener("click", ()=>{
+  if (!state.mediaRecorder) return;
+  if (state.mediaRecorder.state === "recording"){
+    state.mediaRecorder.pause();
+    state.pauseStartedAt = Date.now();
+    setRecPauseIcon(true);
+  } else if (state.mediaRecorder.state === "paused"){
+    state.mediaRecorder.resume();
+    state.pausedElapsedMs += Date.now() - state.pauseStartedAt;
+    state.pauseStartedAt = null;
+    setRecPauseIcon(false);
+  }
+});
+function setRecPauseIcon(isPaused){
+  $("recPauseIcon").innerHTML = isPaused
+    ? `<path d="M8 5v14l11-7z"/>`                                   // play (resume) icon
+    : `<rect x="6" y="5" width="4" height="14"/><rect x="14" y="5" width="4" height="14"/>`; // pause icon
+  $("recordingBar").classList.toggle("paused", isPaused);
+}
+
+/* ---- Real waveform capture via Web Audio (replaces random placeholder bars) ---- */
+function setupWaveformAnalyser(stream){
+  try{
+    state.audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    const source = state.audioCtx.createMediaStreamSource(stream);
+    state.analyser = state.audioCtx.createAnalyser();
+    state.analyser.fftSize = 256;
+    source.connect(state.analyser);
+    state.waveformDataArray = new Uint8Array(state.analyser.frequencyBinCount);
+  } catch(e){ state.analyser = null; /* fall back to animated placeholder only */ }
+}
+function teardownWaveformAnalyser(){
+  if (state.audioCtx){ state.audioCtx.close().catch(()=>{}); state.audioCtx = null; }
+  state.analyser = null;
 }
 
 function buildRecWaveBars(){
@@ -2689,10 +3447,24 @@ function buildRecWaveBars(){
 let recWaveRAF = null;
 function animateRecWave(){
   const bars = $("recWave").querySelectorAll("span");
+  let sampleCounter = 0;
   function tick(){
     if (!$("recordingBar").classList.contains("active")) return;
-    bars.forEach(b=> b.style.height = (4+Math.random()*16)+"px");
-    recWaveRAF = setTimeout(tick, 180);
+    if (state.mediaRecorder && state.mediaRecorder.state === "paused"){ recWaveRAF = setTimeout(tick, 180); return; }
+    let level = 0.3 + Math.random()*0.5; // fallback if analyser unavailable
+    if (state.analyser){
+      state.analyser.getByteFrequencyData(state.waveformDataArray);
+      const avg = state.waveformDataArray.reduce((a,b)=>a+b,0) / state.waveformDataArray.length;
+      level = Math.min(1, avg / 90);
+      // Sample amplitude periodically into the waveform we'll store with the message.
+      sampleCounter++;
+      if (sampleCounter % 2 === 0){
+        state.recordedWaveform.push(6 + Math.round(level * 22));
+        if (state.recordedWaveform.length > 40) state.recordedWaveform.shift();
+      }
+    }
+    bars.forEach(b=> b.style.height = (4 + level*18) + "px");
+    recWaveRAF = setTimeout(tick, 100);
   }
   tick();
 }
@@ -2701,12 +3473,14 @@ function stopRecording(discard){
   if (!state.mediaRecorder || state.mediaRecorder.state === "inactive") return;
   clearInterval(state.recordingTimerInterval);
   clearTimeout(recWaveRAF);
-  const duration = (Date.now()-state.recordingStartTime)/1000;
-  $("recordingBar").classList.remove("active");
+  const wasPausedMs = state.pauseStartedAt ? (Date.now() - state.pauseStartedAt) : 0;
+  const duration = (Date.now()-state.recordingStartTime-state.pausedElapsedMs-wasPausedMs)/1000;
+  $("recordingBar").classList.remove("active","paused");
   $("composerInputWrap").style.display = "flex";
 
   state.mediaRecorder.onstop = ()=>{
     state.mediaRecorder.stream.getTracks().forEach(t=>t.stop());
+    teardownWaveformAnalyser();
     if (discard || duration < 1){
       if (duration < 1 && !discard) showToast("Recording too short", "warning", 2000);
       return;
@@ -2718,16 +3492,12 @@ function stopRecording(discard){
     $("previewVoiceDur").textContent = formatDuration(duration);
     $("voicePreviewModal").classList.add("show");
   };
+  if (state.mediaRecorder.state === "paused"){
+    // Some browsers require resuming before stop() will flush data reliably.
+    state.mediaRecorder.resume();
+  }
   state.mediaRecorder.stop();
 }
-$("micBtn").addEventListener("contextmenu", e=>e.preventDefault());
-
-// stop when clicking mic again while recording
-$("micBtn").addEventListener("click", ()=>{
-  if (state.mediaRecorder && state.mediaRecorder.state === "recording"){
-    stopRecording(false);
-  }
-});
 
 $("previewVoicePlay").addEventListener("click", ()=>{
   const audio = $("voicePlayerHidden");
@@ -2742,6 +3512,7 @@ $("previewVoicePlay").addEventListener("click", ()=>{
 });
 $("voiceCancelBtn").addEventListener("click", ()=>{
   $("voicePreviewModal").classList.remove("show");
+  if (state.pendingVoiceURL){ URL.revokeObjectURL(state.pendingVoiceURL); state.pendingVoiceURL = null; }
   state.recordedBlob = null;
 });
 $("voiceSendBtn").addEventListener("click", async ()=>{
@@ -2749,12 +3520,15 @@ $("voiceSendBtn").addEventListener("click", async ()=>{
   $("voicePreviewModal").classList.remove("show");
   const blob = state.recordedBlob;
   const duration = state.recordedDuration;
+  const waveform = state.recordedWaveform && state.recordedWaveform.length ? state.recordedWaveform.slice(-24) : null;
   state.recordedBlob = null;
-  await uploadVoiceAndSend(blob, duration);
+  await uploadVoiceAndSend(blob, duration, waveform);
 });
 
-async function uploadVoiceAndSend(blob, duration){
+async function uploadVoiceAndSend(blob, duration, waveform){
   if (!requireAuth()) return;
+  if (state.isUploading){ showToast("Please wait for the current upload to finish", "warning", 2000); return; }
+  state.isUploading = true;
   const tempId = `upload-${Date.now()}`;
   const row = document.createElement("div");
   row.className = "msg-row mine"; row.id = tempId;
@@ -2765,20 +3539,22 @@ async function uploadVoiceAndSend(blob, duration){
     const path = `voice/${state.currentEmail}/${Date.now()}.webm`;
     const storageRef = ref(storage, path);
     const task = uploadBytesResumable(storageRef, blob, { contentType: blob.type||"audio/webm" });
-    task.on("state_changed",(snap)=>{
-      const pct = Math.round((snap.bytesTransferred/snap.totalBytes)*100);
-      const fill = row.querySelector(".upload-progress-fill");
-      if (fill) fill.style.width = pct+"%";
-    },(err)=>{ row.remove(); handleError("upload", err); },
-    async ()=>{
-      const url = await getDownloadURL(task.snapshot.ref);
-      row.remove();
-      await addDoc(messagesCol(), {
-        type:"voice", senderEmail: state.currentEmail, recipientEmail: state.otherEmail,
-        status:"sent", timestamp: serverTimestamp(), fileURL:url, duration
-      });
+    await new Promise((resolve, reject)=>{
+      task.on("state_changed",(snap)=>{
+        const pct = Math.round((snap.bytesTransferred/snap.totalBytes)*100);
+        const fill = row.querySelector(".upload-progress-fill");
+        if (fill) fill.style.width = pct+"%";
+      }, reject, resolve);
     });
+    const url = await getDownloadURL(task.snapshot.ref);
+    row.remove();
+    const payload = { type:"voice", senderEmail: state.currentEmail, recipientEmail: state.otherEmail,
+      status:"sent", timestamp: serverTimestamp(), fileURL:url, duration };
+    if (waveform) payload.waveform = waveform;
+    if (state.replyingTo){ payload.replyTo = state.replyingTo; hideComposerContext(); }
+    await addDoc(messagesCol(), payload);
   } catch(err){ row.remove(); handleError("upload", err); }
+  finally{ state.isUploading = false; }
 }
 
 /* =====================================================================
@@ -2924,6 +3700,7 @@ function setupCallUI(mode, type){
     $("callControlsOutgoing").style.display = "none";
     $("callControlsActive").style.display = "flex";
     $("toggleCamBtn").style.display = type === "video" ? "flex" : "none";
+    $("switchCamBtn").style.display = type === "video" ? "flex" : "none";
   }
 }
 
@@ -2982,6 +3759,7 @@ function onCallConnected(){
   $("callControlsOutgoing").style.display = "none";
   $("callControlsActive").style.display = "flex";
   $("toggleCamBtn").style.display = state.callType === "video" ? "flex" : "none";
+  $("switchCamBtn").style.display = state.callType === "video" ? "flex" : "none";
   if (!state.callTimerInterval){
     state.callSeconds = 0;
     state.callTimerInterval = setInterval(()=>{
@@ -3002,13 +3780,27 @@ function listenToIncomingCalls(){
   const unsub = onSnapshot(callDocRef(), (snap)=>{
     const data = snap.data();
     if (!data) { hideIncomingBanner(); return; }
+    const bannerWasShowing = $("incomingCallBanner").classList.contains("show");
     if (data.status === "ringing" && data.calleeEmail === state.currentEmail && state.callRole !== "callee" && !state.pc){
       showIncomingBanner(data);
     } else if (data.status !== "ringing"){
+      // If the banner was up and we never answered, and it's now "ended"
+      // (the caller gave up / timed out) rather than something we did
+      // ourselves (accept/decline), that's a missed call worth flagging.
+      if (bannerWasShowing && data.status === "ended" && state.callRole !== "callee"){
+        notifyMissedCall(data);
+      }
       hideIncomingBanner();
     }
   }, ()=>{});
   state.unsubscribers.push(unsub);
+}
+
+function notifyMissedCall(data){
+  const name = getOtherDisplayName();
+  showToast(`Missed ${data.type} call from ${name}`, "warning", 4000);
+  showDesktopNotification(name, `Missed ${data.type} call`);
+  playNotificationSound();
 }
 
 function showIncomingBanner(data){
@@ -3094,12 +3886,57 @@ $("toggleCamBtn").addEventListener("click", ()=>{
   $("localVideo").style.opacity = state.isCamOff ? "0.15" : "1";
 });
 
-$("speakerBtn").addEventListener("click", ()=>{
-  const remoteVideo = $("remoteVideo");
-  if (typeof remoteVideo.setSinkId === "function"){
-    showToast("Speaker toggle depends on device audio routing", "info", 2000);
+/* ---- Switch camera (front/back) ---- */
+state.facingMode = "user";
+$("switchCamBtn").addEventListener("click", async ()=>{
+  if (!state.localStream || !state.pc) return;
+  const btn = $("switchCamBtn");
+  btn.disabled = true;
+  try{
+    state.facingMode = state.facingMode === "user" ? "environment" : "user";
+    const newStream = await navigator.mediaDevices.getUserMedia({
+      audio:false, video:{ facingMode:{ ideal: state.facingMode }, width:{ideal:640}, height:{ideal:480} }
+    });
+    const newTrack = newStream.getVideoTracks()[0];
+    const sender = state.pc.getSenders().find(s=> s.track && s.track.kind === "video");
+    if (sender && newTrack){
+      await sender.replaceTrack(newTrack);
+      const oldTrack = state.localStream.getVideoTracks()[0];
+      if (oldTrack){ state.localStream.removeTrack(oldTrack); oldTrack.stop(); }
+      state.localStream.addTrack(newTrack);
+      $("localVideo").srcObject = state.localStream;
+    }
+  } catch(err){
+    state.facingMode = state.facingMode === "user" ? "environment" : "user"; // revert on failure
+    showToast("Couldn't switch camera — this device may only have one", "warning", 2500);
+  } finally{
+    btn.disabled = false;
   }
-  $("speakerBtn").classList.toggle("active");
+});
+
+/* ---- Speaker output routing (where the browser supports setSinkId) ---- */
+state.usingSpeaker = true;
+$("speakerBtn").addEventListener("click", async ()=>{
+  const remoteAudioEl = $("remoteVideo"); // audio plays through this element for both call types
+  if (typeof remoteAudioEl.setSinkId !== "function"){
+    return showToast("This browser doesn't support switching audio output", "info", 2200);
+  }
+  try{
+    const devices = await navigator.mediaDevices.enumerateDevices();
+    const outputs = devices.filter(d=> d.kind === "audiooutput");
+    if (outputs.length < 2){
+      return showToast("No alternate audio output found on this device", "info", 2200);
+    }
+    state.usingSpeaker = !state.usingSpeaker;
+    const target = state.usingSpeaker
+      ? outputs.find(d=> /speaker/i.test(d.label)) || outputs[0]
+      : outputs.find(d=> /default|earpiece|receiver/i.test(d.label)) || outputs[0];
+    await remoteAudioEl.setSinkId(target.deviceId);
+    $("speakerBtn").classList.toggle("active", state.usingSpeaker);
+    showToast(state.usingSpeaker ? "Speaker on" : "Speaker off", "info", 1500);
+  } catch(err){
+    showToast("Couldn't change audio output", "warning", 2000);
+  }
 });
 
 async function endCall(notifyRemote){
@@ -3218,6 +4055,18 @@ function cleanupAllListeners(){
   state.myPhotoURL = null;
   state.otherPhotoURL = null;
   state.currentBackground = null;
+  state.messageCache.clear();
+  state.pinnedMessageId = null;
+  state.oldestDocSnapshot = null;
+  state.noMoreOlderMessages = false;
+  state.replyingTo = null;
+  state.editingMessageId = null;
+  state.isUploading = false;
+  state.isSending = false;
+  if ($("pinBanner")) $("pinBanner").classList.remove("show");
+  if ($("loadOlderBtn")) $("loadOlderBtn").classList.remove("show");
+  if (state.searchActive) closeSearch();
+  hideComposerContext();
   if ($("messagesWrap")) $("messagesWrap").style.background = "";
   if (state._loveBannerInterval){ clearInterval(state._loveBannerInterval); state._loveBannerInterval = null; }
   document.title = "Aurora Chat";
